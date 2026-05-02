@@ -111,15 +111,18 @@ def run_merge_tasks(
     tasks: Iterable[MergeTask],
     overwrite: bool,
     log: Callable[[str], None],
+    progress: Callable[[int, int, Path], None] | None = None,
 ) -> MergeSummary:
     summary = MergeSummary()
     task_list = list(tasks)
     summary.scanned_folders = len(task_list)
 
-    for task in task_list:
+    for index, task in enumerate(task_list, start=1):
         if task.output_path.exists() and not overwrite:
             summary.skipped += 1
             log(f"[건너뜀] 이미 존재: {task.output_path}")
+            if progress is not None:
+                progress(index, len(task_list), task.folder)
             continue
 
         try:
@@ -128,10 +131,14 @@ def run_merge_tasks(
             summary.failed += 1
             log(f"[실패] {task.folder}")
             log(f"       원인: {exc}")
+            if progress is not None:
+                progress(index, len(task_list), task.folder)
             continue
 
         summary.succeeded += 1
         log(f"[성공] {task.output_path} ({len(task.input_pdfs)}개 파일, {pages}페이지)")
+        if progress is not None:
+            progress(index, len(task_list), task.folder)
 
     return summary
 
@@ -207,6 +214,7 @@ class PdfMergeApp(tk.Tk):
             self.root_path.set(selected)
             self.tasks = ()
             self.merge_button.configure(state="disabled")
+            self.progress.configure(mode="determinate", maximum=1, value=0)
             self.status.set("스캔을 실행하세요.")
             self.clear_log()
 
@@ -242,6 +250,7 @@ class PdfMergeApp(tk.Tk):
         if not self.tasks:
             self.status.set("PDF 파일이 들어있는 폴더를 찾지 못했습니다.")
             self.merge_button.configure(state="disabled")
+            self.progress.configure(mode="determinate", maximum=1, value=0)
             self.log("[정보] 병합 대상이 없습니다.")
             return
 
@@ -251,6 +260,7 @@ class PdfMergeApp(tk.Tk):
             self.log(f"       입력: {len(task.input_pdfs)}개 PDF")
 
         self.status.set(f"병합 대상 폴더 {len(self.tasks)}개를 찾았습니다.")
+        self.progress.configure(mode="determinate", maximum=len(self.tasks), value=0)
         self.merge_button.configure(state="normal")
 
     def merge(self) -> None:
@@ -261,8 +271,8 @@ class PdfMergeApp(tk.Tk):
 
         self.scan_button.configure(state="disabled")
         self.merge_button.configure(state="disabled")
-        self.progress.start(10)
-        self.status.set("병합 중입니다...")
+        self.progress.configure(mode="determinate", maximum=len(self.tasks), value=0)
+        self.status.set(self.progress_message(0, len(self.tasks), None))
         self.log("")
         self.log("[시작] PDF 병합을 시작합니다.")
 
@@ -274,7 +284,10 @@ class PdfMergeApp(tk.Tk):
         def queue_log(message: str) -> None:
             self.worker_queue.put(("log", message))
 
-        summary = run_merge_tasks(self.tasks, self.overwrite.get(), queue_log)
+        def queue_progress(done: int, total: int, folder: Path) -> None:
+            self.worker_queue.put(("progress", (done, total, folder)))
+
+        summary = run_merge_tasks(self.tasks, self.overwrite.get(), queue_log, queue_progress)
         self.worker_queue.put(("done", summary))
 
     def _poll_worker(self) -> None:
@@ -283,6 +296,9 @@ class PdfMergeApp(tk.Tk):
                 event, payload = self.worker_queue.get_nowait()
                 if event == "log":
                     self.log(str(payload))
+                elif event == "progress":
+                    done, total, folder = payload  # type: ignore[misc]
+                    self.update_progress(int(done), int(total), folder)  # type: ignore[arg-type]
                 elif event == "done":
                     self._finish_merge(payload)  # type: ignore[arg-type]
                     return
@@ -290,8 +306,21 @@ class PdfMergeApp(tk.Tk):
             pass
         self.after(100, self._poll_worker)
 
+    def progress_message(self, done: int, total: int, folder: Path | None) -> str:
+        percent = int(done / total * 100) if total else 0
+        message = f"{done} / {total} 완료 ({percent}%)"
+        if folder is not None:
+            message = f"{message} - 현재: {folder.name}"
+        return message
+
+    def update_progress(self, done: int, total: int, folder: Path) -> None:
+        self.progress.configure(maximum=total)
+        self.progress["value"] = done
+        self.status.set(self.progress_message(done, total, folder))
+
     def _finish_merge(self, summary: MergeSummary) -> None:
-        self.progress.stop()
+        if self.tasks:
+            self.progress.configure(maximum=len(self.tasks), value=len(self.tasks))
         self.scan_button.configure(state="normal")
         self.merge_button.configure(state="normal" if self.tasks else "disabled")
         message = (

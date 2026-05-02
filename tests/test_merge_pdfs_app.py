@@ -4,6 +4,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
 
@@ -80,6 +81,28 @@ class PdfMergeAppTests(unittest.TestCase):
             self.assertTrue(output.exists())
             self.assertEqual(len(PdfReader(str(output)).pages), 5)
 
+    def test_progress_callback_reports_each_processed_folder(self) -> None:
+        with temp_directory() as tmp:
+            root = Path(tmp) / "Root"
+            first = root / "A"
+            second = root / "B"
+            first.mkdir(parents=True)
+            second.mkdir()
+            create_pdf(first / "a.pdf", 1)
+            create_pdf(second / "b.pdf", 1)
+
+            tasks = scan_merge_tasks(root)
+            progress_events: list[tuple[int, int, str]] = []
+            summary = run_merge_tasks(
+                tasks,
+                overwrite=False,
+                log=lambda message: None,
+                progress=lambda done, total, folder: progress_events.append((done, total, folder.name)),
+            )
+
+            self.assertEqual(summary.succeeded, 2)
+            self.assertEqual(progress_events, [(1, 2, "A"), (2, 2, "B")])
+
     def test_existing_output_is_skipped_without_overwrite(self) -> None:
         with temp_directory() as tmp:
             root = Path(tmp) / "Root"
@@ -89,11 +112,39 @@ class PdfMergeAppTests(unittest.TestCase):
 
             tasks = scan_merge_tasks(root)
             logs: list[str] = []
-            summary = run_merge_tasks(tasks, overwrite=False, log=logs.append)
+            progress_events: list[tuple[int, int, str]] = []
+            summary = run_merge_tasks(
+                tasks,
+                overwrite=False,
+                log=logs.append,
+                progress=lambda done, total, folder: progress_events.append((done, total, folder.name)),
+            )
 
             self.assertEqual(summary.succeeded, 0)
             self.assertEqual(summary.skipped, 1)
             self.assertEqual(summary.failed, 0)
+            self.assertEqual(progress_events, [(1, 1, "Root")])
+
+    def test_progress_callback_reports_failed_folder(self) -> None:
+        with temp_directory() as tmp:
+            root = Path(tmp) / "Root"
+            root.mkdir()
+            create_pdf(root / "broken.pdf", 1)
+
+            tasks = scan_merge_tasks(root)
+            progress_events: list[tuple[int, int, str]] = []
+            with patch("merge_pdfs_app.merge_pdf_files", side_effect=ValueError("broken")):
+                summary = run_merge_tasks(
+                    tasks,
+                    overwrite=False,
+                    log=lambda message: None,
+                    progress=lambda done, total, folder: progress_events.append((done, total, folder.name)),
+                )
+
+            self.assertEqual(summary.succeeded, 0)
+            self.assertEqual(summary.skipped, 0)
+            self.assertEqual(summary.failed, 1)
+            self.assertEqual(progress_events, [(1, 1, "Root")])
 
     def test_generated_pdfs_are_not_inputs(self) -> None:
         with temp_directory() as tmp:
